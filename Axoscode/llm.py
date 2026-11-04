@@ -3,7 +3,7 @@ import os
 
 from openai import OpenAI
 from Axoscode import config
-from Axoscode.tools import TOOL_SCHEMAS
+from Axoscode.tools import TOOL_SCHEMAS, TOOLS
 
 client = OpenAI(
     base_url=config.BASE_URL,
@@ -21,38 +21,35 @@ def call_llm(messages , tools = None):
         tools=tools or TOOL_SCHEMAS,
         tool_choice="auto",
         max_tokens=config.CONTEXT_WINDOW,
-        compact_at=config.COMPACT_AT,
-        compact_to=config.COMPACT_TO,
     )
-    messages = messages.choices[0].message
+    message = response.choices[0].message
 
-    completion_details = response.usage.completion_tokens
-    prompt_details = response.usage.prompt_tokens
-    
     usage = {
         "prompt_tokens": response.usage.prompt_tokens,
         "completion_tokens": response.usage.completion_tokens,
-        "reasoning_tokens": response.usage.reasoning_tokens,
-        "cached_tokens": response.usage.cached_tokens,
+        "reasoning_tokens": getattr(getattr(response.usage, "completion_tokens_details", None), "reasoning_tokens", 0),
+        "cached_tokens": getattr(getattr(response.usage, "prompt_tokens_details", None), "cached_tokens", 0),
         "total_tokens": response.usage.total_tokens,
     }
 
-    return messages , usage
+    return message , usage
 
 if __name__ == "__main__":
     user_input = input("Enter your prompt: ")
 
-    message ,usage = call_llm([
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_input}
-    ])
+    ]
 
-    print("\nAgent :",message.content, "\n")
+    message , usage = call_llm(messages)
 
-    if message.tool_calls:
-        tool_call = message.tool_calls[0]
+    print("\nAgent :", message.content, "\n")
+
+    for tool_call in message.tool_calls or []:
         args = json.loads(tool_call.function.arguments)
-        resut = TOOLS[tool_call.function.name](**args)
-        print("\nTool :",tool_call.function.name, "\n")
+        result = TOOLS[tool_call.function.name](**args)
+        print("\nTool :", tool_call.function.name, "\n")
+        print("Result :", result, "\n")
 
     print(usage)

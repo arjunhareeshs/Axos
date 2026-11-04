@@ -1,0 +1,3 @@
+TOOL_SCHEMAS = []
+
+TOOLS = {}

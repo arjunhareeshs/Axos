@@ -7,11 +7,15 @@ authors = [
     { name = "arjunhareeshs", email = "arjunhareeshsenthil@gmail.com" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["openai>=1.40.0"]
 
 [project.scripts]
-axos = "axos:main"
+axos = "Axoscode.agent:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "Axoscode"

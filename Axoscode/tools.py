@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import subprocess
 
 from . import history
@@ -89,6 +90,7 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "bash",
             "description": "Run a shell command and return its combined stdout and stderr.",
+            "is_concurrency_safe": False,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -106,6 +108,7 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "read_file",
             "description": "Read a file and return its contents.",
+            "is_concurrency_safe": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,6 +126,7 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "read_skill",
             "description": "Open a skill by name and return its full instructions.",
+            "is_concurrency_safe": True,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -140,6 +144,7 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "write_file",
             "description": "Create a file, or overwrite it if it already exists.",
+            "is_concurrency_safe": False,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -154,10 +159,11 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "str_replace",
-            "description": (
-                "Replace exact text in a file. old_str must appear exactly once, "
-                "so include surrounding lines if needed."
-            ),
+                "description": (
+                    "Replace exact text in a file. old_str must appear exactly once, "
+                    "so include surrounding lines if needed."
+                ),
+                "is_concurrency_safe": False,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -186,3 +192,41 @@ TOOLS = {
     "write_todos": write_todos,
     "task": task,
 }
+
+
+def partition_tool_calls(tool_calls, safety_map):
+    """Single-pass reduce: group consecutive concurrency-safe calls into one
+    batch; every unsafe call gets its own solo batch.
+
+    Returns a list of batches, each batch a list of tool_call objects.
+    Safe batches may run in parallel; unsafe batches run one at a time.
+    """
+    batches = []
+    current = []
+
+    for call in tool_calls:
+        name = call.function.name
+        safe = safety_map.get(name, False)
+
+        if safe and current and config_safe(current[0]):
+            current.append(call)
+        else:
+            if current:
+                batches.append(current)
+            current = [call]
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
+def config_safe(call):
+    from . import config
+
+    return config.TOOL_CONCURRENCY_SAFE.get(call.function.name, False)
+
+
+async def execute_async(tool_call):
+    """Run one tool call through execute() in a thread so it won't block."""
+    return await asyncio.to_thread(execute, tool_call)

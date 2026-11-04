@@ -27,3 +27,16 @@ CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", 128_000))
 # Fractions of CONTEXT_WINDOW — history.fit / compact multiply these.
 COMPACT_AT = 0.85
 COMPACT_TO = 0.35
+
+MAX_TURNS = 50
+STUCK_LOOP_THRESHOLD = 3
+
+TOOL_CONCURRENCY_SAFE = {
+    "read_file": True,
+    "read_skill": True,
+    "bash": False,
+    "write_file": False,
+    "str_replace": False,
+    "write_todos": False,
+    "task": False,
+}

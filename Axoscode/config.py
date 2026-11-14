@@ -9,18 +9,22 @@ if ENV_FILE.exists():
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
 
-# Prefer plain names from .env; fall back to AXOS_* then defaults.
-BASE_URL = (
-    os.environ.get("BASE_URL")
-    or os.environ.get("AXOS_BASE_URL")
-    or "https://api.openai.com/v1"
-)
-API_KEY = os.environ.get("API_KEY") or os.environ.get("AXOS_API_KEY") or ""
-MODEL = (
-    os.environ.get("MODEL")
-    or os.environ.get("AXOS_MODEL")
-    or "gpt-4o-mini"
-)
+def _env(*names, default=""):
+    for name in names:
+        if os.environ.get(name):
+            return os.environ[name]
+    return default
+
+
+# Provider loader (LiteLLM). MODEL may be a full LiteLLM id such as
+# "anthropic/claude-sonnet-4-5"; a bare id gets "<PROVIDER>/" prefixed.
+PROVIDER = _env("PROVIDER", "AXOS_PROVIDER", default="openai")
+MODEL = _env("MODEL", "AXOS_MODEL", default="gpt-4o-mini")
+# None lets LiteLLM use each provider's own default endpoint / env key.
+BASE_URL = _env("BASE_URL", "AXOS_BASE_URL") or None
+API_KEY = _env("API_KEY", "AXOS_API_KEY") or None
+# "chat" -> chat/completions, "responses" -> the Responses API.
+API_FORMAT = _env("API_FORMAT", "AXOS_API_FORMAT", default="chat").lower()
 
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", 128_000))
 

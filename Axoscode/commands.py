@@ -57,7 +57,7 @@ def compact(messages):
         # nearly full - the worst moment to lose the session over a rate limit.
         ui.note(f"compaction failed ({type(failure).__name__}); transcript kept as is")
         return messages
-    if len(compacted) == before:
+    if compacted is messages:
         ui.note("nothing old enough to compact yet")
         return messages
     session.compacted(compacted)

@@ -10,6 +10,9 @@ Public surface (unchanged for callers):
     complete_text(messages)                -> str   (no tools, for compaction)
 """
 
+import asyncio
+import base64
+import functools
 import json
 import os
 from types import SimpleNamespace
@@ -17,35 +20,65 @@ from types import SimpleNamespace
 # Use the bundled model-cost map; skip the network fetch LiteLLM does on import.
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-import litellm  # noqa: E402
+import litellm
 
-from Axoscode import config
+from Axoscode import config, failures
 from Axoscode.tools import TOOL_SCHEMAS, TOOLS
 
 litellm.drop_params = True  # ignore params a given provider doesn't support
 
-MAX_TOKENS = 8192
-
-
 # ------------------------------------------------------------------ helpers
 
-def get_model():
-    """LiteLLM model id: 'provider/model' (provider prefixed if missing)."""
-    model = config.MODEL
-    return model if "/" in model else f"{config.PROVIDER}/{model}"
+def get_model(model=None):
+    """LiteLLM model id: 'provider/model' (provider prefixed if missing).
+
+    Defaults to MODEL; pass another name (e.g. VISION_MODEL) to resolve it
+    the same way.
+    """
+    model, provider = model or config.MODEL, config.PROVIDER
+    if not model:
+        raise RuntimeError(
+            "No model set. Put MODEL=<model id> in .env (see the placeholder there)."
+        )
+    if provider:
+        # Always prefix: OpenRouter/Groq model names contain "/" themselves
+        # (e.g. anthropic/claude-sonnet-4.5), which must not be read as a provider.
+        return model if model.startswith(f"{provider}/") else f"{provider}/{model}"
+    return model if "/" in model else f"openai/{model}"
 
 
 def _use_responses():
     return config.API_FORMAT == "responses"
 
 
-def _common():
-    kwargs = {"model": get_model()}
+def _common(model=None):
+    kwargs = {"model": get_model(model)}
     if config.API_KEY:
         kwargs["api_key"] = config.API_KEY
     if config.BASE_URL:
         kwargs["api_base"] = config.BASE_URL
+    if config.PROMPT_CACHE and _use_responses():
+        kwargs["prompt_cache_key"] = "axos"  # routes requests to the same cache
     return kwargs
+
+
+EXPLICIT_CACHE_PROVIDERS = {"anthropic", "bedrock", "vertex_ai"}
+
+
+def _with_cache_markers(messages):
+    """Mark cache breakpoints on a copy (stored history is untouched).
+
+    OpenAI/Gemini cache a stable prefix automatically; Anthropic-style
+    providers need explicit breakpoints: one on the system prompt (also
+    covers the tools) and one on the last stable message. The agent puts
+    its volatile reminder last, so the stable end is messages[-2].
+    """
+    if not config.PROMPT_CACHE or get_model().split("/")[0] not in EXPLICIT_CACHE_PROVIDERS:
+        return messages
+    marked = list(messages)
+    for i in {0, len(marked) - 2} & set(range(len(marked))):
+        marked[i] = {**marked[i], "cache_control": {"type": "ephemeral"}}
+    return marked
 
 
 def _clean_tools(tools):
@@ -124,8 +157,19 @@ def _usage(u):
     }
 
 
+def _retried(function):
+    """Retry a blocking model call on transient failures (see failures.py)."""
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        return failures.with_retries(lambda: function(*args, **kwargs), get_model())
+
+    return wrapper
+
+
 # --------------------------------------------------------------- sync calls
 
+@_retried
 def call_llm(messages, tools=None):
     """One blocking call. Returns (message, usage) where message has
     .content, .tool_calls and .model_dump()."""
@@ -134,7 +178,7 @@ def call_llm(messages, tools=None):
             input=_responses_input(messages),
             tools=_responses_tools(tools),
             tool_choice="auto",
-            max_output_tokens=MAX_TOKENS,
+            max_output_tokens=config.MAX_TOKENS,
             **_common(),
         )
         text, calls = [], []
@@ -151,10 +195,10 @@ def call_llm(messages, tools=None):
         return message, _usage(response.usage)
 
     response = litellm.completion(
-        messages=messages,
+        messages=_with_cache_markers(messages),
         tools=_clean_tools(tools),
         tool_choice="auto",
-        max_tokens=MAX_TOKENS,
+        max_tokens=config.MAX_TOKENS,
         **_common(),
     )
     return response.choices[0].message, _usage(response.usage)
@@ -187,6 +231,7 @@ class _Message:
         return data
 
 
+@_retried
 def complete_text(messages):
     """Plain completion with no tools (used by compaction)."""
     if _use_responses():
@@ -204,6 +249,34 @@ def complete_text(messages):
     return response.choices[0].message.content
 
 
+def describe_image(png, prompt):
+    """Ask a vision model about one image (PNG bytes). Always uses the
+    chat-completions format, whatever API_FORMAT is."""
+    model = config.VISION_MODEL or config.MODEL
+    kwargs = _common(model)
+    kwargs.pop("prompt_cache_key", None)
+    if not litellm.supports_vision(model=kwargs["model"]):
+        raise RuntimeError(
+            f"{kwargs['model']} has no vision support; set VISION_MODEL in .env"
+        )
+    url = "data:image/png;base64," + base64.b64encode(png).decode()
+    response = failures.with_retries(
+        lambda: litellm.completion(
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }],
+            max_tokens=config.MAX_TOKENS,
+            **kwargs,
+        ),
+        kwargs["model"],
+    )
+    return response.choices[0].message.content or ""
+
+
 # ------------------------------------------------------------ streaming call
 
 async def call_llm_stream(messages, tools=None):
@@ -215,20 +288,37 @@ async def call_llm_stream(messages, tools=None):
         {"type": "tool_call", "call": <ToolCall>}
         {"type": "usage", ...}
     """
-    if _use_responses():
-        async for event in _stream_responses(messages, tools):
-            yield event
-    else:
-        async for event in _stream_chat(messages, tools):
-            yield event
+    stream = _stream_responses if _use_responses() else _stream_chat
+    model = get_model()
+    attempt = 0
+
+    while True:
+        started = False
+        try:
+            async for event in stream(messages, tools):
+                started = True
+                yield event
+            return
+        except Exception as failure:  # noqa: BLE001 - classified in decide()
+            if started:
+                # Text already reached the caller, so a retry would repeat it.
+                kind, _ = failures.classify(failure)
+                raise failures.LLMError(
+                    kind,
+                    f"The response from {model} was cut off "
+                    f"({failures.detail(failure)}). Send your message again.",
+                ) from failure
+            delay = failures.decide(failure, attempt, model)
+        await asyncio.sleep(delay)
+        attempt += 1
 
 
 async def _stream_chat(messages, tools):
     stream = await litellm.acompletion(
-        messages=messages,
+        messages=_with_cache_markers(messages),
         tools=_clean_tools(tools),
         tool_choice="auto",
-        max_tokens=MAX_TOKENS,
+        max_tokens=config.MAX_TOKENS,
         stream=True,
         stream_options={"include_usage": True},
         **_common(),
@@ -277,7 +367,7 @@ async def _stream_responses(messages, tools):
         input=_responses_input(messages),
         tools=_responses_tools(tools),
         tool_choice="auto",
-        max_output_tokens=MAX_TOKENS,
+        max_output_tokens=config.MAX_TOKENS,
         stream=True,
         **_common(),
     )

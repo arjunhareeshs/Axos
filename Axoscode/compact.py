@@ -90,22 +90,23 @@ def safe_boundary(messages, start):
 def tail_start(messages, budget):
     """Walk back from the end, taking messages until the tail fills `budget`."""
     total = 0
-    for index in range(len(messages) - 1, 0, -1):
+    for index in range(len(messages) - 1, -1, -1):
         total += estimate([messages[index]])
         if total > budget:
             return safe_boundary(messages, index)
-    return safe_boundary(messages, 1)
+    return 0  # everything fits: there is nothing older than the tail
 
 
 def compact(messages):
-    """system + summary + a recent tail. The caller freezes what comes back."""
+    """Summary + a recent tail. `messages` is the stored history, which has
+    no system message. Returns `messages` itself when nothing was compacted.
+    """
     cut = tail_start(messages, config.CONTEXT_WINDOW * config.COMPACT_TO)
-    if cut <= 1:
+    if cut <= 0:
         return messages  # nothing old enough to be worth summarising
 
-    summary = summarize(messages[1:cut])
+    summary = summarize(messages[:cut])
     kept = [
-        messages[0],
         {"role": "user", "content": HANDOFF.format(summary=summary)},
         *messages[cut:],
     ]

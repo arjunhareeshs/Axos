@@ -1,36 +1,46 @@
 import shutil
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
-PROJECT = Path.cwd().resolve()
+from .workspace import PROJECT, current
 
-PROFILE = f"""(version 1)
+
+def writable(cwd):
+    """Paths a command may write: the project, or only a subagent's worktree.
+
+    A worktree keeps its index under the main repository's .git, so that one
+    directory stays writable; the rest of the main tree is read-only to it.
+    """
+    return [PROJECT] if cwd == PROJECT else [cwd, PROJECT / ".git"]
+
+
+def profile(cwd):
+    """macOS seatbelt profile."""
+    allowed = " ".join(f'(subpath "{path}")' for path in writable(cwd))
+    return f"""(version 1)
 (deny default)
 (allow process-exec process-fork signal)
 (allow file-read*)
 (allow sysctl-read)
 (deny network*)
-(allow file-write* (subpath "{PROJECT}") (literal "/dev/null"))
-(deny file-write* (subpath "{PROJECT}/.git"))
+(allow file-write* {allowed} (literal "/dev/null"))
 """
 
 
-def wrap(command):
+def wrap(command, cwd):
     """Wrap a shell command in an OS sandbox. None means we have no sandbox."""
     if sys.platform == "darwin":
-        profile = Path(tempfile.gettempdir()) / "neuralcode.sb"
-        profile.write_text(PROFILE)
-        return ["sandbox-exec", "-f", str(profile), "/bin/sh", "-c", command]
+        return ["sandbox-exec", "-p", profile(cwd), "/bin/sh", "-c", command]
 
     if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        binds = [arg for path in writable(cwd) for arg in ("--bind", str(path), str(path))]
         return [
             "bwrap",
             "--ro-bind", "/", "/",
-            "--bind", str(PROJECT), str(PROJECT),
+            *binds,
             "--dev", "/dev", "--proc", "/proc",
             "--unshare-net", "--die-with-parent",
+            "--chdir", str(cwd),
             "/bin/sh", "-c", command,
         ]
 
@@ -46,11 +56,13 @@ def name():
 
 
 def run(command, timeout=60):
-    """Run a command, sandboxed when the OS lets us."""
-    sandboxed = wrap(command)
+    """Run a command in the caller's workspace, sandboxed when the OS lets us."""
+    cwd = current()
+    sandboxed = wrap(command, cwd)
     return subprocess.run(
         sandboxed or command,
         shell=sandboxed is None,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,

@@ -24,7 +24,15 @@ SKILLS = find_skills()
 
 
 def skills_prompt():
-    return "\n".join(f"- {name}: {s['description']}" for name, s in SKILLS.items())
+    """System-prompt section listing the skills, or "" when there are none.
+
+    Built from SKILLS, which is read once at import, so it is constant for
+    the life of the process and safe to put in a cached prompt.
+    """
+    if not SKILLS:
+        return ""
+    listing = "\n".join(f"- {name}: {s['description']}" for name, s in SKILLS.items())
+    return f"\n\nSkills (open one with read_skill before using it):\n{listing}"
 
 
 def read_skill(name: str) -> str:

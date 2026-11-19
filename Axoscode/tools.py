@@ -2,13 +2,23 @@ import os
 import json
 import asyncio
 import subprocess
+import threading
+import time
 
+from . import browser
+from . import config
+from . import documents
 from . import history
 from . import sandbox
+from . import workspace
 from .permissions import check
-from .subagent import TASK_SCHEMA ,task
+from .subagent import SPAWN_SCHEMA, spawn_agents
 from .skills import read_skill
 from .todos import TODO_SCHEMA ,write_todos
+
+# Parallel subagents share one terminal: only one approval prompt at a time.
+APPROVAL_LOCK = threading.Lock()
+
 
 def bash(command: str) -> str:
     try:
@@ -21,16 +31,16 @@ def bash(command: str) -> str:
     return history.cap((result.stdout +result.stderr) or "(no output)")
 
 def read_file(path:str) -> str:
-    with open(path) as f:
-        return history.cap(f.read())
+    return history.cap(documents.read(workspace.resolve(path)))
 
 def write_file(path:str , content:str) -> str:
-    with open(path , "w") as f:
+    with open(workspace.resolve(path), "w") as f:
         f.write(content)
     return  f"Wrote {path}"
 
 def str_replace(path ,old_str ,new_str ,allow_multi_edit = False):
-    with open(path) as f:
+    target = workspace.resolve(path)
+    with open(target) as f:
         content = f.read()
 
     count = content.count(old_str)
@@ -43,7 +53,7 @@ def str_replace(path ,old_str ,new_str ,allow_multi_edit = False):
             "or set allow_multi_edit to replace them all."
         )
 
-    with open(path, "w") as f:
+    with open(target, "w") as f:
         f.write(content.replace(old_str, new_str))
     return f"Replaced {count} match(es) in {path}"
 
@@ -73,9 +83,14 @@ def execute(tool_call):
         action, reason = check(name, args)
         if action == "deny":
             return args, f"Blocked by policy: {reason}"
-        if action == "ask" and not ui.approve(reason):
-            return args, "The user denied this tool call."
-        return args, TOOLS[name](**args)
+        if action == "ask":
+            with APPROVAL_LOCK:
+                approved = ui.approve(reason)
+            if not approved:
+                return args, "The user denied this tool call."
+        result = TOOLS[name](**args)
+        time.sleep(config.TOOL_DELAY_MS / 1000)  # a short, visible pause between actions
+        return args, result
     except TypeError as mismatch:
         return args, f"Error: wrong arguments for {name} ({mismatch})."
     except KeyError as missing:
@@ -107,7 +122,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file and return its contents.",
+            "description": "Read a file and return its contents as text. Also reads PDF, Word (.docx) and image files: text, tables (as Markdown) and descriptions of images.",
             "is_concurrency_safe": True,
             "parameters": {
                 "type": "object",
@@ -180,7 +195,8 @@ TOOL_SCHEMAS = [
         },
     },
     TODO_SCHEMA,
-    TASK_SCHEMA,
+    SPAWN_SCHEMA,
+    *browser.SCHEMAS,
 ]
 
 TOOLS = {
@@ -190,8 +206,20 @@ TOOLS = {
     "str_replace": str_replace,
     "read_skill": read_skill,
     "write_todos": write_todos,
-    "task": task,
+    "spawn_agents": spawn_agents,
+    **browser.TOOLS,
 }
+
+
+def tools_prompt():
+    """System-prompt section naming every tool, generated from the registry
+    so it cannot drift from what the model is actually given."""
+    lines = []
+    for schema in TOOL_SCHEMAS:
+        function = schema["function"]
+        summary = function["description"].split(". ")[0].rstrip(".")
+        lines.append(f"- `{function['name']}`: {summary}.")
+    return "\n\n# Tool reference\nEvery tool you have:\n" + "\n".join(lines)
 
 
 def partition_tool_calls(tool_calls, safety_map):
@@ -222,8 +250,6 @@ def partition_tool_calls(tool_calls, safety_map):
 
 
 def config_safe(call):
-    from . import config
-
     return config.TOOL_CONCURRENCY_SAFE.get(call.function.name, False)
 
 

@@ -40,6 +40,13 @@ def compacted(messages):
     WRITTEN = len(messages)
 
 
+def log_agent(event):
+    """Record a subagent being spawned or finishing (the agent graph)."""
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    with path_for(CURRENT).open("a") as f:
+        f.write(json.dumps({"agent": event}) + "\n")
+
+
 def load(session_id):
     """Replay the log: messages accumulate, rewinds cut them back."""
     messages = []
@@ -55,6 +62,8 @@ def load(session_id):
             del messages[entry["rewind_to"]:]
         elif "compacted" in entry:
             messages = list(entry["compacted"])
+        elif "agent" in entry:
+            continue  # subagent lifecycle record, not a chat message
         else:
             messages.append(entry)
     return messages

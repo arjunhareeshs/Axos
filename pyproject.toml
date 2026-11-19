@@ -9,7 +9,12 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "litellm>=1.109.1",
+    "pdfplumber>=0.11.10",
+    "pillow>=12.3.0",
+    "playwright>=1.65.2",
     "prompt-toolkit>=3.0.53",
+    "pypdf>=7.1.0",
+    "python-docx>=1.2.0",
     "pyyaml>=6.0.3",
     "rich>=13.0.0",
 ]

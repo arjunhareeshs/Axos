@@ -6,9 +6,7 @@ still stop and ask.
 """
 
 from fnmatch import fnmatch
-from pathlib import Path
-
-PROJECT = Path.cwd().resolve()
+from . import workspace
 
 # Last matching rule wins, so put the catch-all first.
 BASH_RULES = {
@@ -105,8 +103,11 @@ def decide(command):
     return "allow"
 
 
-def inside_project(path):
-    return PROJECT in Path(path).resolve().parents
+def inside_workspace(path):
+    """Is the path inside the caller's working tree (project or worktree)?"""
+    root = workspace.current()
+    target = workspace.resolve(path).resolve()
+    return target == root or root in target.parents
 
 
 def check(name, args):
@@ -114,7 +115,14 @@ def check(name, args):
     if name == "bash":
         return decide(args["command"]), f"run: {args['command']}"
 
-    if name in ("write_file", "str_replace") and not inside_project(args["path"]):
-        return "ask", f"{name} outside {PROJECT}: {args['path']}"
+    if name in ("write_file", "str_replace") and not inside_workspace(args["path"]):
+        return "ask", f"{name} outside {workspace.current()}: {args['path']}"
+
+    # The browser reaches the network, which shell commands may not. Opening
+    # one is your decision; so is sending a local file to a web page.
+    if name == "browser_create_session":
+        return "ask", "open a web browser (gives the agent access to the internet)"
+    if name == "browser_upload":
+        return "ask", f"upload to a web page: {', '.join(args.get('paths') or [])}"
 
     return "allow", None

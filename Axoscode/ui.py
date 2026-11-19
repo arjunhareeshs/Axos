@@ -82,6 +82,10 @@ class UI:
     def note(self, text):
         self.console.print(Padding(Text(text, style=MUTED), (1, 0, 0, 2)))
 
+    def alert(self, text):
+        """A warning the user should notice: a retry, a limit, an outage."""
+        self.console.print(Padding(Text(f"! {text}", style=f"bold {TOOL}"), (1, 0, 0, 2)))
+
     def pick(self, title, rows):
         """Numbered list; returns the chosen index or None."""
         self.console.print(Padding(Text(title, style=f"bold {ACCENT}"), (1, 0, 0, 2)))
@@ -99,7 +103,7 @@ class UI:
             return prompt.read("> ").strip()
         except (EOFError, KeyboardInterrupt):
             self.console.print()
-            return ""
+            return None  # ctrl-d / ctrl-c: the caller exits
 
     # --------------------------------------------------------------- output
 
@@ -119,11 +123,13 @@ class UI:
             )
         )
 
-    def tool(self, name, args, result, nested=False):
+    def tool(self, name, args, result, owner=None):
+        """`owner` is the subagent that made the call, if any."""
         if name == "write_todos" and args.get("todos"):
             return self.todos(args["todos"])
 
         header = Text.assemble(
+            (f"{owner} › " if owner else "", ACCENT),
             (f"{name} ", f"bold {TOOL}"),
             (self._format_args(args), MUTED),
         )
@@ -134,17 +140,17 @@ class UI:
                     border_style=MUTED,
                     padding=(0, 1),
                 ),
-                (1, 2, 0, 6 if nested else 2),
+                (1, 2, 0, 6 if owner else 2),
             )
         )
 
-    def subagent(self, description):
+    def subagent(self, name, description):
         """Shown to you, never to the main agent - it only gets the report."""
         self.console.print(
             Padding(
                 Panel(
                     Text(description.strip(), style=MUTED),
-                    title=Text("subagent · own context", style=f"bold {ACCENT}"),
+                    title=Text(f"subagent · {name}", style=f"bold {ACCENT}"),
                     title_align="left",
                     border_style=ACCENT,
                     padding=(0, 1),

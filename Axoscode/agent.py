@@ -6,36 +6,40 @@ async parallel execution for independent tool calls.
 
 import asyncio
 
-from . import (
-    config,
-    context,
-    compact,
-    history,
-    session,
-    ui,
-    commands,
-    sandbox,
-)
+import litellm
+
+from . import browser, commands, compact, config, context, history, sandbox, session, subagent
+from .failures import LLMError
 from .llm import call_llm_stream
-from .tools import TOOL_SCHEMAS, execute_async, partition_tool_calls
+from .skills import skills_prompt
+from .tools import TOOL_SCHEMAS, execute_async, partition_tool_calls, tools_prompt
+from .ui import ui
 
 
-def _system_prompt() -> str:
-    return (
-        "You are Axos, a terminal coding agent. "
-        "Use read-only tools in parallel batches; mutating tools "
-        "(write_file, str_replace, bash) run one at a time. "
-        "When finished, answer without calling more tools."
-    )
+def _load_system_prompt() -> str:
+    """Read the instructions once at startup.
+
+    Constant for the life of the process on purpose: a byte-identical prefix
+    is what the provider caches.
+    """
+    try:
+        text = config.SYSTEM_PROMPT_FILE.read_text().strip()
+    except OSError as failure:
+        raise SystemExit(
+            f"Cannot read the system prompt {config.SYSTEM_PROMPT_FILE}: {failure}"
+        )
+    return text + tools_prompt() + skills_prompt()
 
 
-def _build_messages(messages: list, user_input: str) -> list:
-    msgs = [{"role": "system", "content": _system_prompt()}]
+SYSTEM_PROMPT = _load_system_prompt()
+
+
+def _build_messages(messages: list) -> list:
+    """History is append-only; the volatile reminder goes last, unstored."""
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
     reminder = context.reminder()
     if reminder["content"].strip():
         msgs.append(reminder)
-    msgs.extend(messages)
-    msgs.append({"role": "user", "content": user_input})
     return msgs
 
 
@@ -71,101 +75,140 @@ def _detect_stuck(last: list, current: list) -> bool:
     return last == current
 
 
-async def main() -> None:
-    ui.banner(sandbox.name())
+async def _model_turn(messages: list) -> list:
+    """One model call. Appends the assistant message; returns its tool calls."""
+    msgs = _build_messages(messages)
+    history.fit(msgs)
 
-    messages: list = []
-    turn = 0
+    text, tool_calls = [], []
+    async for event in call_llm_stream(msgs, tools=TOOL_SCHEMAS):
+        if event["type"] == "content_block_delta":
+            text.append(event["text"])
+        elif event["type"] == "tool_call":
+            tool_calls.append(event["call"])
+        elif event["type"] == "usage":
+            ui.usage({k: v for k, v in event.items() if k != "type"})
+
+    content = "".join(text)
+    if content:
+        ui.agent(content)
+
+    assistant_msg = {"role": "assistant", "content": content or None}
+    if tool_calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in tool_calls
+        ]
+    messages.append(assistant_msg)
+    return tool_calls
+
+
+def _compact(messages: list) -> list:
+    """Summarise old history. A failure here keeps the transcript as it is."""
+    try:
+        compacted = compact.compact(messages)
+    except Exception as failure:  # noqa: BLE001
+        ui.note(f"Compaction failed ({type(failure).__name__}); transcript kept as is.")
+        return messages
+    if compacted is not messages:
+        session.compacted(compacted)
+        ui.compacted(len(messages), compacted)
+    return compacted
+
+
+async def _respond(messages: list) -> list:
+    """Work on the latest user message until the model stops calling tools."""
     stuck_count = 0
     last_signatures: list = []
 
-    while turn < config.MAX_TURNS:
-        turn += 1
-
+    for _ in range(config.MAX_TURNS):
         try:
-            user_input = ui.ask()
-        except (EOFError, KeyboardInterrupt):
-            ui.note("")
+            tool_calls = await _model_turn(messages)
+        except Exception as failure:  # noqa: BLE001 - provider/network errors
+            # Nothing was appended, so the history is intact: just retry.
+            ui.alert(
+                str(failure)
+                if isinstance(failure, LLMError)
+                else f"Model call failed ({type(failure).__name__}: {failure})."
+            )
+            ui.note("Your request is kept; send a message to continue.")
+            break
+        if not tool_calls:
             break
 
-        if not user_input:
-            continue
-
-        if user_input.startswith("/"):
-            messages = commands.handle(user_input, messages)
-            continue
-
-        msgs = _build_messages(messages, user_input)
-        history.fit(msgs)
-
-        tool_calls = []
-        assistant_text = []
-
-        async for event in call_llm_stream(msgs, tools=TOOL_SCHEMAS):
-            etype = event["type"]
-
-            if etype == "content_block_delta":
-                text = event.get("text", "")
-                if text:
-                    assistant_text.append(text)
-            elif etype == "tool_call":
-                tool_calls.append(event["call"])
-
-        full_text = "".join(assistant_text)
-
-        assistant_msg = {"role": "assistant", "content": full_text or None}
-        if tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        if not tool_calls:
-            session.save(messages)
-            continue
-
-        new_signatures = [_tool_signature(tc) for tc in tool_calls]
-        if _detect_stuck(last_signatures, new_signatures):
-            stuck_count += 1
-        else:
-            stuck_count = 0
-        last_signatures = new_signatures
-
+        signatures = [_tool_signature(tc) for tc in tool_calls]
+        stuck_count = stuck_count + 1 if _detect_stuck(last_signatures, signatures) else 0
+        last_signatures = signatures
         if stuck_count >= config.STUCK_LOOP_THRESHOLD:
             ui.note(f"Stuck loop detected ({stuck_count} repeats); ending turn.")
-            session.save(messages)
+            # Every tool call needs a result, or the next request is rejected.
+            for tool_call in tool_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "Not run: the same calls were repeated; turn ended.",
+                    }
+                )
             break
 
-        executed = await _run_batches(tool_calls)
-
-        for tool_call, (args, result) in executed:
+        subagent.set_parent_context(messages)
+        for tool_call, (args, result) in await _run_batches(tool_calls):
             messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                }
+                {"role": "tool", "tool_call_id": tool_call.id, "content": result}
             )
-            ui.tool(tool_call.function.name, args, result)
+            if tool_call.function.name != "spawn_agents":
+                ui.tool(tool_call.function.name, args, result)
 
         session.save(messages)
 
         if history.estimate(messages) > config.CONTEXT_WINDOW * config.COMPACT_AT:
-            before = len(messages)
-            messages = compact.compact(messages)
-            session.compacted(messages)
-            ui.compacted(before, messages)
+            messages = _compact(messages)
+    else:
+        ui.note(f"Stopped at the {config.MAX_TURNS}-call limit for one prompt.")
+
+    session.save(messages)
+    history.sweep()  # spilled tool output only lives for the turn
+    return messages
+
+
+async def run() -> None:
+    ui.banner(sandbox.name())
+    messages: list = []
+
+    try:
+        while True:
+            # Terminal input runs its own event loop, so it gets its own thread.
+            user_input = await asyncio.to_thread(ui.ask)
+            if user_input is None:
+                break
+            if not user_input:
+                continue
+            if user_input.startswith("/"):
+                messages = await asyncio.to_thread(commands.handle, user_input, messages)
+                continue
+
+            messages.append({"role": "user", "content": user_input})
+            messages = await _respond(messages)
+    finally:
+        # Close LiteLLM's HTTP clients while the event loop is still running.
+        await litellm.close_litellm_async_clients()
+        await asyncio.to_thread(browser.shutdown)
 
     ui.summary()
 
 
+def main() -> None:
+    """Console-script entry point (`axos`)."""
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
